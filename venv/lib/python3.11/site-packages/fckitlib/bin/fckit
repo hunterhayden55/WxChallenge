@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+
+FCKIT_VERSION_STR="0.14.1"
+FCKIT_VERSION="0.14.1"
+
+FCKIT_MAJOR_VERSION=0
+FCKIT_MINOR_VERSION=14
+FCKIT_PATCH_VERSION=1
+
+FCKIT_GIT_SHA1="67dd4877bae70a734f423dcb95bce1cd241fc18f"
+
+#################################################################
+# Commands
+#################################################################
+
+usage()
+{
+  echo "Usage: fckit [--version] [--info] [--git]"
+  exit $1
+}
+
+version()
+{
+  echo "0.14.1"
+}
+
+print_feature()
+{
+  if [ -z "$1" ]; then
+    echo "OFF"
+  elif [[ $1 =~ (true|TRUE|ON|1) ]]; then
+    echo "ON"
+  else
+    echo "OFF"
+  fi
+}
+
+
+info()
+{
+  echo "fckit version (0.14.1), git-sha1 67dd4877bae70a734f423dcb95bce1cd241fc18f"
+  echo ""
+  echo "Build:"
+  echo "  build type      : RelWithDebInfo"
+  echo "  timestamp       : 20251209080023"
+  echo "  op. system      : Darwin-22.5.0 (macosx.64)"
+  echo "  processor       : arm64"
+  echo "  sources         : /opt/actions-runner/work/_work/python-develop-bundle/python-develop-bundle/src/fckit"
+  echo "  c++ compiler    : AppleClang 14.0.3.14030022"
+  echo "    flags         :  -pipe -O2 -g -DNDEBUG"
+  echo "  fortran compiler: GNU 15.1.0"
+  echo "    flags         :  -O2 -g -DNDEBUG"
+  echo ""
+  echo "Features:"
+  echo "  MPI             : $(print_feature )"
+  echo "  final           : $(print_feature 1)"
+  echo "  eckit           : $(print_feature 1)"
+  echo ""
+  echo "Dependencies: "
+  if [ -n "1" ]; then
+  echo "  eckit version (1.32.4), git-sha1 $(short_gitsha1 5a883e5ad31ba61f6f3b39fcc03226125df744de)"
+  else
+  echo "  None"
+  fi
+}
+
+gitsha1()
+{
+  echo "67dd4877bae70a734f423dcb95bce1cd241fc18f"
+}
+
+short_gitsha1()
+{
+  if [ -z "$1" ]; then
+    echo "unknown"
+  else
+    echo $1 | head -c 13
+  fi
+}
+
+#################################################################
+# Parse command-line
+#################################################################
+
+if test $# -eq 0; then
+    usage 1
+fi
+
+while test $# -gt 0; do
+
+    # Split --option=value in $opt="--option" and $val="value"
+
+    opt=""
+    val=""
+
+    case "$1" in
+    --*=*)
+      opt=`echo "$1" | sed 's/=.*//'`
+      val=`echo "$1" | sed 's/--[_a-zA-Z0-9]*=//'`
+      ;;
+    --*)
+      opt=$1
+      ;;
+    *)
+      break
+      ;;
+    esac
+
+    # Parse options
+    case "$opt" in
+      --version)
+        version
+        ;;
+      --git)
+        gitsha1
+          ;;
+      --info)
+        info
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        echo "unknown option: $opt"
+        usage 1
+        ;;
+    esac
+    shift
+done

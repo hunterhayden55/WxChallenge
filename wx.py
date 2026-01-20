@@ -13,7 +13,7 @@ import json
 # ==========================================
 # CONFIGURATION
 # ==========================================
-os.environ['HERBIE_SAVE_DIR'] = r"D:\WxChallenge\data"
+os.environ['HERBIE_SAVE_DIR'] = r"~/Downloads/WxChallenge/data"
 from herbie import Herbie
 
 warnings.filterwarnings("ignore")
@@ -201,9 +201,11 @@ def process_model(model, run_date, lat, lon, fxx_list, verbose_prefix=""):
                         for f in files: 
                             if os.path.exists(f): os.remove(f)
                     elif os.path.exists(files): os.remove(files)
-                except: pass
+                except Exception as e:
+                    print(f"\nERROR processing {model} hour {fxx}: {e}")
 
-        except: pass
+        except Exception as e:
+            print(f"\nERROR processing {model} hour {fxx}: {e}")
 
         try:
             ds_prcp = H.xarray(search=search_prcp, verbose=False)
@@ -255,7 +257,8 @@ def train_models(station_id, lat, lon, target_date, history_df):
         obs = history_df.loc[lookup_date]
         
         # Check Cache First
-        if date_key in cache[station_id]:
+        # FIX: Only use cache if GFS, NAM, and HRRR are all present
+        if date_key in cache[station_id] and 'gfs' in cache[station_id][date_key]:
             print(f"      Using Cached Data for {date_key}")
             day_results = cache[station_id][date_key]
         else:
