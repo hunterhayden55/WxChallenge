@@ -9,6 +9,8 @@ import warnings
 import shutil
 import time
 import json
+import contextlib
+import io
 
 # ==========================================
 # CONFIGURATION
@@ -20,7 +22,7 @@ warnings.filterwarnings("ignore")
 
 # --- USER SETTINGS ---
 TRAINING_DAYS = 10  
-DELETE_GRIBS = True
+DELETE_GRIBS = False  # <--- Files will definitely stay now
 CACHE_FILE = "wx_model_cache.json"
 
 # ==========================================
@@ -40,11 +42,15 @@ def save_cache(cache_data):
         json.dump(cache_data, f, indent=4)
 
 # ==========================================
-# 2. INPUTS
+# 2. INPUTS & CYCLE DETECTION
 # ==========================================
 def get_inputs():
-    print(f"\n--- WxChallenge Forecaster (v8.0 Caching Edition) ---")
+    print(f"\n--- WxChallenge Forecaster (v9.7 Force Save) ---")
     print(f"    Training Window: Last {TRAINING_DAYS} Days")
+    
+    print(f"    DEBUG: DELETE_GRIBS is set to {DELETE_GRIBS}")
+    if not DELETE_GRIBS:
+        print(f"    DEBUG: GRIB files will be PERMANENTLY saved to:\n           {os.environ['HERBIE_SAVE_DIR']}")
     
     station_input = input("Enter Station Identifier (e.g., KHOU): ").upper().strip()
     if len(station_input) == 3: station_input = "K" + station_input
@@ -82,7 +88,31 @@ def get_inputs():
     end_window = start_window + timedelta(hours=24)
     
     print(f"Forecast Window (UTC): {start_window} to {end_window}")
-    return station_input, lat, lon, start_window, end_window
+    
+    # --- CYCLE DETECTION ---
+    now_utc = datetime.utcnow()
+    run_date_base = start_window - timedelta(days=1) 
+    
+    is_live_run = (now_utc.date() == run_date_base.date())
+    
+    current_cycle = 12 
+    
+    if is_live_run:
+        if now_utc.hour >= 22 and now_utc.minute >= 30:
+            current_cycle = 18
+        elif now_utc.hour >= 23:
+            current_cycle = 18
+        else:
+            current_cycle = 12
+    else:
+        if now_utc > (run_date_base + timedelta(hours=23)):
+            current_cycle = 18
+        else:
+            current_cycle = 12
+
+    print(f"Current Cycle Selection: {current_cycle}Z")
+    
+    return station_input, lat, lon, start_window, end_window, current_cycle
 
 # ==========================================
 # 3. HISTORY (OBSERVATIONS)
@@ -155,73 +185,150 @@ def robust_interp(ds, target_lat, target_lon):
     except Exception as e:
         raise e
 
-def process_model(model, run_date, lat, lon, fxx_list, verbose_prefix=""):
+def safe_cleanup(H, search_str):
+    """Only deletes files if DELETE_GRIBS is explicitly True"""
+    if not DELETE_GRIBS:
+        return 
+        
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            files = H.get_localFilePath(search=search_str)
+        if isinstance(files, list):
+            for f in files: 
+                if os.path.exists(f): os.remove(f)
+        elif os.path.exists(files): os.remove(files)
+    except: pass
+
+def fetch_precip_value(H, lat, lon, search_str):
+    try:
+        # Explicit download first to ensure persistence
+        with contextlib.redirect_stdout(io.StringIO()):
+            H.download(search=search_str, verbose=False)
+            ds_prcp = H.xarray(search=search_str, verbose=False)
+        
+        if isinstance(ds_prcp, list): ds_prcp = ds_prcp[0]
+        pt_p = robust_interp(ds_prcp, lat, lon)
+        
+        raw_p = 0.0
+        if 'tp' in pt_p: raw_p = pt_p['tp'].values
+        elif 'apcp' in pt_p: raw_p = pt_p['apcp'].values
+        
+        ds_prcp.close()
+        
+        if np.isnan(raw_p): return 0.0
+        return raw_p * 0.0393701 
+    except:
+        return 0.0
+
+def process_model(model, run_date, lat, lon, fxx_list, verbose_prefix="", debug=False):
     product = 'sfc' if model == 'hrrr' else 'pgrb2.0p25'
     if model == 'nam': product = 'awphys'
     
     search_main = ":TMP:2 m|:UGRD:10 m|:VGRD:10 m|:GUST:surface"
-    search_prcp = ":APCP:.*:0-1" 
+    search_prcp = ":APCP:" 
     
     temps, winds, gusts = [], [], []
     total_prcp = 0.0
 
+    # --- PRECIPITATION BASELINE ---
+    prev_accum_precip = 0.0
+    start_fxx = fxx_list[0]
+    
+    # Retry logic for baseline precip
+    if start_fxx > 0:
+        for attempt in range(5): # Retry up to 5 times
+            try:
+                H_prev = Herbie(run_date, model=model, product=product, fxx=start_fxx-1, verbose=False)
+                prev_accum_precip = fetch_precip_value(H_prev, lat, lon, search_prcp)
+                safe_cleanup(H_prev, search_prcp)
+                break # Success, exit retry loop
+            except:
+                time.sleep(2)
+                if attempt == 4: prev_accum_precip = 0.0 # Give up after 5 tries
+
     for fxx in fxx_list:
-        if verbose_prefix:
+        if verbose_prefix and not debug:
             print(f"{verbose_prefix} Hour {fxx}...", end="\r")
         
-        try:
-            H = Herbie(run_date, model=model, product=product, fxx=fxx, verbose=False)
-            ds_main = H.xarray(search=search_main, verbose=False)
-            if isinstance(ds_main, list): ds_list = ds_main
-            else: ds_list = [ds_main]
+        t_val, w_val, g_val = None, None, None
+        hourly_p_val = 0.0
+        
+        # ==========================================
+        # 1. Fetch Temp/Wind (WITH RETRY)
+        # ==========================================
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    H = Herbie(run_date, model=model, product=product, fxx=fxx, verbose=False)
+                    # FORCE DOWNLOAD TO DISK
+                    H.download(search=search_main, verbose=False)
+                    ds_main = H.xarray(search=search_main, verbose=False)
+                
+                if isinstance(ds_main, list): ds_list = ds_main
+                else: ds_list = [ds_main]
 
-            t_val, u_val, v_val, g_val = None, None, None, 0.0
+                u_val, v_val = None, None
+                g_val = 0.0
 
-            for ds in ds_list:
-                pt = robust_interp(ds, lat, lon)
-                if 't2m' in pt: t_val = (pt['t2m'].values - 273.15) * 9/5 + 32
-                if 'u10' in pt: u_val = pt['u10'].values
-                if 'v10' in pt: v_val = pt['v10'].values
-                if 'gust' in pt: g_val = pt['gust'].values * 1.94384
-                ds.close()
+                for ds in ds_list:
+                    pt = robust_interp(ds, lat, lon)
+                    if 't2m' in pt: t_val = (pt['t2m'].values - 273.15) * 9/5 + 32
+                    if 'u10' in pt: u_val = pt['u10'].values
+                    if 'v10' in pt: v_val = pt['v10'].values
+                    if 'gust' in pt: g_val = pt['gust'].values * 1.94384
+                    ds.close()
 
-            w_val = 0.0
-            if u_val is not None and v_val is not None:
-                w_val = np.sqrt(u_val**2 + v_val**2) * 1.94384
-            
-            if t_val is not None:
-                temps.append(t_val)
-                winds.append(w_val)
-                gusts.append(g_val)
-            
-            if DELETE_GRIBS:
-                try:
-                    files = H.get_localFilePath(search=search_main)
-                    if isinstance(files, list):
-                        for f in files: 
-                            if os.path.exists(f): os.remove(f)
-                    elif os.path.exists(files): os.remove(files)
-                except Exception as e:
-                    print(f"\nERROR processing {model} hour {fxx}: {e}")
+                if u_val is not None and v_val is not None:
+                    w_val = np.sqrt(u_val**2 + v_val**2) * 1.94384
+                
+                if t_val is not None:
+                    temps.append(t_val)
+                    winds.append(w_val if w_val is not None else 0.0)
+                    gusts.append(g_val if g_val is not None else 0.0)
+                
+                safe_cleanup(H, search_main)
+                
+                # If we got here without error, break the retry loop
+                break 
 
-        except Exception as e:
-            print(f"\nERROR processing {model} hour {fxx}: {e}")
+            except Exception as e:
+                # If it failed, wait a few seconds and try again
+                if attempt < max_retries - 1:
+                    if debug: print(f"      ...Connection blip (Hour {fxx}), retrying ({attempt+1}/{max_retries})...")
+                    time.sleep(3)
+                else:
+                    # If we ran out of retries, pass (results in MISS)
+                    pass
 
-        try:
-            ds_prcp = H.xarray(search=search_prcp, verbose=False)
-            if isinstance(ds_prcp, list): ds_prcp = ds_prcp[0]
-            pt_p = robust_interp(ds_prcp, lat, lon)
-            p_val = 0.0
-            if 'tp' in pt_p: p_val = pt_p['tp'].values
-            elif 'apcp' in pt_p: p_val = pt_p['apcp'].values
-            if not np.isnan(p_val): total_prcp += (p_val * 0.0393701)
-            ds_prcp.close()
-            if DELETE_GRIBS:
-                try:
-                    f_p = H.get_localFilePath(search=search_prcp)
-                    if os.path.exists(f_p): os.remove(f_p)
-                except: pass
-        except: pass
+        # ==========================================
+        # 2. Fetch Precip & Decumulate (WITH RETRY)
+        # ==========================================
+        for attempt in range(max_retries):
+            try:
+                current_accum_precip = fetch_precip_value(H, lat, lon, search_prcp)
+                
+                delta = current_accum_precip - prev_accum_precip
+                if delta < 0: hourly_p_val = current_accum_precip
+                else: hourly_p_val = delta
+                
+                prev_accum_precip = current_accum_precip
+                total_prcp += hourly_p_val
+                
+                safe_cleanup(H, search_prcp)
+                break # Success, exit loop
+            except:
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                else:
+                    pass
+
+        # --- 3. Print Hourly Detail ---
+        if debug:
+            t_str = f"{t_val:.1f}" if t_val is not None else "MISS"
+            w_str = f"{w_val:.1f}" if w_val is not None else "MISS"
+            p_str = f"{hourly_p_val:.4f}"
+            print(f"      [{model.upper()}] Hour {fxx}: Temp={t_str} Wind={w_str} Prcp={p_str}\"")
 
     if not temps: return None
     
@@ -234,12 +341,12 @@ def process_model(model, run_date, lat, lon, fxx_list, verbose_prefix=""):
     }
 
 # ==========================================
-# 5. TRAINING LOOP (WITH CACHE)
+# 5. TRAINING LOOP (DUAL CACHE)
 # ==========================================
-def train_models(station_id, lat, lon, target_date, history_df):
+def train_models(station_id, lat, lon, target_date, history_df, current_cycle):
     print(f"\n[2/6] Training Models (Backtesting last {TRAINING_DAYS} days)...")
+    print(f"      Strategy: Caching BOTH 12Z and 18Z. Weighting based on {current_cycle}Z.")
     
-    # Load Cache
     cache = load_cache()
     if station_id not in cache: cache[station_id] = {}
     
@@ -256,44 +363,49 @@ def train_models(station_id, lat, lon, target_date, history_df):
             
         obs = history_df.loc[lookup_date]
         
-        # Check Cache First
-        # FIX: Only use cache if GFS, NAM, and HRRR are all present
-        if date_key in cache[station_id] and 'gfs' in cache[station_id][date_key]:
-            print(f"      Using Cached Data for {date_key}")
-            day_results = cache[station_id][date_key]
-        else:
-            # Download if not in cache
-            past_run_date = past_target_date - timedelta(days=1)
-            past_run_date = past_run_date.replace(hour=12, minute=0, second=0, microsecond=0)
+        # --- DUAL CYCLE PROCESSING (12Z AND 18Z) ---
+        for cycle_check in [12, 18]:
+            cycle_str = str(cycle_check)
             
-            start_win = past_target_date.replace(hour=6)
-            end_win = start_win + timedelta(hours=24)
-            fxx_list = get_model_hours(past_run_date, start_win, end_win)
+            # 1. Check Cache
+            if date_key in cache[station_id] and cycle_str in cache[station_id][date_key]:
+                if cycle_check == current_cycle:
+                    print(f"      Using Cached {cycle_check}Z Data for {date_key}")
+                day_results = cache[station_id][date_key][cycle_str]
             
-            print(f"      Downloading {date_key} (Run: {past_run_date.strftime('%d/12Z')})...")
-            
-            day_results = {}
-            for m in ['gfs', 'nam', 'hrrr']:
-                res = process_model(m, past_run_date, lat, lon, fxx_list, verbose_prefix=f"        [{m.upper()}]")
-                print(f"        [{m.upper()}] Done.                    ", end="\r")
-                if res: day_results[m] = res
-            
-            # Save to cache immediately
-            cache[station_id][date_key] = day_results
-            save_cache(cache)
-
-        # Calculate Errors
-        for m in ['gfs', 'nam', 'hrrr']:
-            if m in day_results:
-                res = day_results[m]
-                err_max = abs(res['max'] - obs['obs_max'])
-                err_min = abs(res['min'] - obs['obs_min'])
-                err_wspd = abs(res['wspd'] - obs['obs_wspd'])
-                err_prcp = abs(res['prcp'] - obs['obs_prcp'])
+            # 2. Download if missing
+            else:
+                past_run_date = past_target_date - timedelta(days=1)
+                past_run_date = past_run_date.replace(hour=cycle_check, minute=0, second=0, microsecond=0)
                 
-                model_errors[m].append({
-                    'max': err_max, 'min': err_min, 'wspd': err_wspd, 'prcp': err_prcp
-                })
+                start_win = past_target_date.replace(hour=6)
+                end_win = start_win + timedelta(hours=24)
+                fxx_list = get_model_hours(past_run_date, start_win, end_win)
+                
+                print(f"\n      >>> DOWNLOADING TRAINING DATA: {date_key} | Cycle: {cycle_check}Z <<<")
+                
+                day_results = {}
+                for m in ['gfs', 'nam', 'hrrr']:
+                    res = process_model(m, past_run_date, lat, lon, fxx_list, verbose_prefix=f"        [{m.upper()}]", debug=True)
+                    if res: day_results[m] = res
+                
+                if date_key not in cache[station_id]: cache[station_id][date_key] = {}
+                cache[station_id][date_key][cycle_str] = day_results
+                save_cache(cache)
+
+            # 3. Calculate Errors (ONLY for the Current Cycle)
+            if cycle_check == current_cycle:
+                for m in ['gfs', 'nam', 'hrrr']:
+                    if m in day_results:
+                        res = day_results[m]
+                        err_max = abs(res['max'] - obs['obs_max'])
+                        err_min = abs(res['min'] - obs['obs_min'])
+                        err_wspd = abs(res['wspd'] - obs['obs_wspd'])
+                        err_prcp = abs(res['prcp'] - obs['obs_prcp'])
+                        
+                        model_errors[m].append({
+                            'max': err_max, 'min': err_min, 'wspd': err_wspd, 'prcp': err_prcp
+                        })
     
     print("\n      Training Complete.")
     return model_errors
@@ -331,20 +443,20 @@ def calculate_weights(model_errors):
 # 6. MAIN
 # ==========================================
 def main():
-    station_id, lat, lon, start_window, end_window = get_inputs()
+    station_id, lat, lon, start_window, end_window, current_cycle = get_inputs()
     
     # 1. History
     history_df = get_hourly_obs(station_id, lat, lon, start_window, days_back=TRAINING_DAYS)
     
-    # 2. Train (With Cache)
-    model_errors = train_models(station_id, lat, lon, start_window, history_df)
+    # 2. Train (With Dual Cache)
+    model_errors = train_models(station_id, lat, lon, start_window, history_df, current_cycle)
     
     # 3. Weights
     weights, maes = calculate_weights(model_errors)
     
     # Print Bias Report
     print("\n" + "="*65)
-    print("HISTORICAL BIAS REPORT (MAE - Lower is Better)")
+    print(f"HISTORICAL BIAS REPORT ({current_cycle}Z Runs - MAE - Lower is Better)")
     print("="*65)
     print(f"{'MODEL':<8} {'MAX T':<12} {'MIN T':<12} {'WIND':<12} {'PRCP':<12}")
     print("-" * 65)
@@ -358,20 +470,19 @@ def main():
 
     # 4. Current Forecast
     print(f"\n[4/6] Generating Current Forecast...")
-    now_utc = datetime.utcnow()
-    run_candidate = now_utc - timedelta(hours=5)
-    hour_block = (run_candidate.hour // 6) * 6
-    model_run_date = run_candidate.replace(hour=hour_block, minute=0, second=0, microsecond=0)
+    
+    run_date_base = start_window - timedelta(days=1)
+    model_run_date = run_date_base.replace(hour=current_cycle, minute=0, second=0, microsecond=0)
     
     print(f"      Using Run: {model_run_date.strftime('%Y-%m-%d %HZ')}")
     fxx_list = get_model_hours(model_run_date, start_window, end_window)
     
     forecasts = {}
     for m in ['gfs', 'nam', 'hrrr']:
-        res = process_model(m, model_run_date, lat, lon, fxx_list, verbose_prefix=f"      [{m.upper()}]")
-        print(f"      [{m.upper()}] Done.                    ", end="\r")
+        print(f"\n      >>> PROCESSING {m.upper()} <<<")
+        res = process_model(m, model_run_date, lat, lon, fxx_list, verbose_prefix=f"      [{m.upper()}]", debug=True)
         if res: forecasts[m] = res
-        else: print(f"\n      [{m.upper()}] Failed.")
+        else: print(f"      [{m.upper()}] Failed.")
 
     # 5. Apply Weights
     print(f"\n\n[5/6] Applying Weighted Consensus...")
@@ -396,6 +507,7 @@ def main():
     print("\n" + "="*60)
     print(f"OFFICIAL GUIDANCE: {station_id}")
     print(f"Valid: {start_window.strftime('%d/%H')}Z to {end_window.strftime('%d/%H')}Z")
+    print(f"Run Cycle Used: {current_cycle}Z")
     print("="*60)
     print(f"{'MODEL':<10} {'MAX':<8} {'MIN':<8} {'WIND':<8} {'GUST':<8} {'PRCP':<8}")
     print("-" * 60)
