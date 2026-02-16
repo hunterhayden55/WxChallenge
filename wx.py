@@ -11,6 +11,7 @@ import time
 import json
 import contextlib
 import io
+from concurrent.futures import ThreadPoolExecutor
 
 # ==========================================
 # CONFIGURATION
@@ -224,111 +225,136 @@ def process_model(model, run_date, lat, lon, fxx_list, verbose_prefix="", debug=
     product = 'sfc' if model == 'hrrr' else 'pgrb2.0p25'
     if model == 'nam': product = 'awphys'
     
-    search_main = ":TMP:2 m|:UGRD:10 m|:VGRD:10 m|:GUST:surface"
-    search_prcp = ":APCP:" 
+    # Combined search string (Fast)
+    search_str = ":TMP:2 m|:UGRD:10 m|:VGRD:10 m|:GUST:surface|:APCP:|:TP:"
     
     temps, winds, gusts = [], [], []
     total_prcp = 0.0
-
-    # --- PRECIPITATION BASELINE ---
     prev_accum_precip = 0.0
-    start_fxx = fxx_list[0]
-    
-    # Retry logic for baseline precip
-    if start_fxx > 0:
-        for attempt in range(5): # Retry up to 5 times
-            try:
-                H_prev = Herbie(run_date, model=model, product=product, fxx=start_fxx-1, verbose=False)
-                prev_accum_precip = fetch_precip_value(H_prev, lat, lon, search_prcp)
-                safe_cleanup(H_prev, search_prcp)
-                break # Success, exit retry loop
-            except:
-                time.sleep(2)
-                if attempt == 4: prev_accum_precip = 0.0 # Give up after 5 tries
 
+    # --- 1. PREPARE DOWNLOAD LIST ---
+    herbie_objs = []
+    # Pre-fetch previous hour for precip subtraction
+    if fxx_list[0] > 0:
+        herbie_objs.append((fxx_list[0]-1, Herbie(run_date, model=model, product=product, fxx=fxx_list[0]-1, verbose=False)))
+    
+    for fxx in fxx_list:
+        herbie_objs.append((fxx, Herbie(run_date, model=model, product=product, fxx=fxx, verbose=False)))
+
+    # --- 2. SAFE PARALLEL DOWNLOAD (4 Threads) ---
+    if verbose_prefix:
+        print(f"{verbose_prefix} Downloading data...", end="\r")
+
+    def _download_worker(item):
+        fxx, h_obj = item
+        try:
+            h_obj.download(search=search_str, verbose=False)
+            return fxx, h_obj
+        except:
+            return fxx, None
+
+    downloaded_map = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(_download_worker, herbie_objs))
+        for fxx, h in results:
+            downloaded_map[fxx] = h
+
+    # --- 3. HELPER: EXTRACT VARIABLES FROM DATASET LIST ---
+    def extract_vars(H_obj):
+        """Handles whether Herbie returns a single Dataset or a List of Datasets"""
+        try:
+            ds_result = H_obj.xarray(search=search_str, verbose=False)
+        except:
+            return None
+
+        # Standardize to list so we can loop
+        if isinstance(ds_result, list):
+            ds_list = ds_result
+        else:
+            ds_list = [ds_result]
+
+        # Placeholders
+        t = None
+        u, v = None, None
+        g = 0.0
+        p = 0.0
+        
+        found_p = False
+
+        for ds in ds_list:
+            try:
+                pt = robust_interp(ds, lat, lon)
+                
+                # Check for Temp
+                if 't2m' in pt: 
+                    t = (float(pt['t2m'].values) - 273.15) * 9/5 + 32
+                
+                # Check for Wind
+                if 'u10' in pt: u = float(pt['u10'].values)
+                if 'v10' in pt: v = float(pt['v10'].values)
+                
+                # Check for Gust
+                if 'gust' in pt: g = float(pt['gust'].values) * 1.94384
+                
+                # Check for Precip (Total Precip or Accumulated Precip)
+                if 'tp' in pt: 
+                    p = float(pt['tp'].values)
+                    found_p = True
+                elif 'apcp' in pt: 
+                    p = float(pt['apcp'].values)
+                    found_p = True
+                    
+                ds.close()
+            except:
+                pass
+        
+        # Calculate Wind Speed Magnitude if we found U and V
+        w = 0.0
+        if u is not None and v is not None:
+            w = np.sqrt(u**2 + v**2) * 1.94384
+            
+        return {'t': t, 'w': w, 'g': g, 'p': p, 'found_p': found_p}
+
+    # --- 4. GET BASELINE PRECIP ---
+    start_fxx = fxx_list[0]
+    if start_fxx > 0 and (start_fxx - 1) in downloaded_map:
+        data = extract_vars(downloaded_map[start_fxx - 1])
+        if data and data['found_p']:
+            prev_accum_precip = data['p']
+
+    # --- 5. PROCESS FORECAST HOURS ---
     for fxx in fxx_list:
         if verbose_prefix and not debug:
-            print(f"{verbose_prefix} Hour {fxx}...", end="\r")
+            print(f"{verbose_prefix} Processing Hour {fxx}...", end="\r")
+            
+        H = downloaded_map.get(fxx)
+        if H is None:
+            continue
+
+        data = extract_vars(H)
         
-        t_val, w_val, g_val = None, None, None
-        hourly_p_val = 0.0
+        if data is None or data['t'] is None:
+            if debug: print(f"      [MISS] Hour {fxx} data missing.")
+            continue
+
+        # Precip Calculation
+        curr_accum_mm = data['p']
+        curr_accum_in = curr_accum_mm * 0.0393701
+        prev_accum_in = prev_accum_precip * 0.0393701
         
-        # ==========================================
-        # 1. Fetch Temp/Wind (WITH RETRY)
-        # ==========================================
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                with contextlib.redirect_stdout(io.StringIO()):
-                    H = Herbie(run_date, model=model, product=product, fxx=fxx, verbose=False)
-                    # FORCE DOWNLOAD TO DISK
-                    H.download(search=search_main, verbose=False)
-                    ds_main = H.xarray(search=search_main, verbose=False)
-                
-                if isinstance(ds_main, list): ds_list = ds_main
-                else: ds_list = [ds_main]
-
-                u_val, v_val = None, None
-                g_val = 0.0
-
-                for ds in ds_list:
-                    pt = robust_interp(ds, lat, lon)
-                    if 't2m' in pt: t_val = (pt['t2m'].values - 273.15) * 9/5 + 32
-                    if 'u10' in pt: u_val = pt['u10'].values
-                    if 'v10' in pt: v_val = pt['v10'].values
-                    if 'gust' in pt: g_val = pt['gust'].values * 1.94384
-                    ds.close()
-
-                if u_val is not None and v_val is not None:
-                    w_val = np.sqrt(u_val**2 + v_val**2) * 1.94384
-                
-                if t_val is not None:
-                    temps.append(t_val)
-                    winds.append(w_val if w_val is not None else 0.0)
-                    gusts.append(g_val if g_val is not None else 0.0)
-                
-                safe_cleanup(H, search_main)
-                
-                # If we got here without error, break the retry loop
-                break 
-
-            except Exception as e:
-                # If it failed, wait a few seconds and try again
-                if attempt < max_retries - 1:
-                    if debug: print(f"      ...Connection blip (Hour {fxx}), retrying ({attempt+1}/{max_retries})...")
-                    time.sleep(3)
-                else:
-                    # If we ran out of retries, pass (results in MISS)
-                    pass
-
-        # ==========================================
-        # 2. Fetch Precip & Decumulate (WITH RETRY)
-        # ==========================================
-        for attempt in range(max_retries):
-            try:
-                current_accum_precip = fetch_precip_value(H, lat, lon, search_prcp)
-                
-                delta = current_accum_precip - prev_accum_precip
-                if delta < 0: hourly_p_val = current_accum_precip
-                else: hourly_p_val = delta
-                
-                prev_accum_precip = current_accum_precip
-                total_prcp += hourly_p_val
-                
-                safe_cleanup(H, search_prcp)
-                break # Success, exit loop
-            except:
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-                else:
-                    pass
-
-        # --- 3. Print Hourly Detail ---
+        delta = curr_accum_in - prev_accum_in
+        if delta < 0: delta = curr_accum_in # Bucket reset
+        
+        hourly_p = delta
+        prev_accum_precip = curr_accum_mm # Update baseline
+        
+        temps.append(data['t'])
+        winds.append(data['w'])
+        gusts.append(data['g'])
+        total_prcp += hourly_p
+        
         if debug:
-            t_str = f"{t_val:.1f}" if t_val is not None else "MISS"
-            w_str = f"{w_val:.1f}" if w_val is not None else "MISS"
-            p_str = f"{hourly_p_val:.4f}"
-            print(f"      [{model.upper()}] Hour {fxx}: Temp={t_str} Wind={w_str} Prcp={p_str}\"")
+            print(f"      [{model.upper()}] Hour {fxx}: T={data['t']:.1f} W={data['w']:.1f} P={hourly_p:.3f}")
 
     if not temps: return None
     
