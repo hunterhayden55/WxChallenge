@@ -250,7 +250,7 @@ def get_usl_forecast(station_id, run_date, start_window, end_window, cycle):
     calc_wspd = float(max(winds))
 
     # --- 2. PROCESS SUMMARY TABLE ---
-    summ_max, summ_min, summ_wind = None, None, None
+    summ_max, summ_min, summ_wind, summ_prcp = None, None, None, None
     try:
         tables = soup.find_all("table")
         for tbl in tables:
@@ -267,6 +267,7 @@ def get_usl_forecast(station_id, run_date, start_window, end_window, cycle):
                         if "Max Temp" in h: summ_max = val
                         if "Min Temp" in h: summ_min = val
                         if "Max Wind" in h: summ_wind = val
+                        if "Precip" in h or "Rain" in h: summ_prcp = val
                     except:
                         pass
                 break
@@ -277,33 +278,46 @@ def get_usl_forecast(station_id, run_date, start_window, end_window, cycle):
     print(f"[USL DEBUG] Hourly Window Max: {calc_max} | Summary Table Max: {summ_max}")
     print(f"[USL DEBUG] Hourly Window Min: {calc_min} | Summary Table Min: {summ_min}")
     print(f"[USL DEBUG] Hourly Window Wind: {calc_wspd} | Summary Table Wind: {summ_wind}")
-
+    print(f"[USL DEBUG] Hourly Window Precip: {total_prcp} | Summary Table Precip: {summ_prcp}")
     # --- 3. 50/50 BLENDING LOGIC (TRUST USL) ---
     
     # MAX TEMP
     final_max = calc_max
     if summ_max is not None:
-        final_max = (calc_max * 0.5) + (summ_max * 0.5)
-        print(f"[USL DEBUG] BLENDING MAX: ({calc_max} + {summ_max}) / 2 = {final_max:.1f}")
-
+        final_max = (calc_max * 0.25) + (summ_max * 0.75)
+        #print(f"[USL DEBUG] BLENDING MAX: ({calc_max} + {summ_max}) / 2 = {final_max:.1f}")
+        print(f"[USL DEBUG] BLENDING MAX: "
+            f"(Hourly {calc_max} * 0.25) + "
+            f"(Summary {summ_max} * 0.75) = {final_max:.2f}")
     # MIN TEMP
     final_min = calc_min
     if summ_min is not None:
-        final_min = (calc_min * 0.5) + (summ_min * 0.5)
-        print(f"[USL DEBUG] BLENDING MIN: ({calc_min} + {summ_min}) / 2 = {final_min:.1f}")
-
+        final_min = (calc_min * 0.25) + (summ_min * 0.75)
+        #print(f"[USL DEBUG] BLENDING MIN: ({calc_min} + {summ_min}) / 2 = {final_min:.1f}")
+        print(f"[USL DEBUG] BLENDING MIN: "
+            f"(Hourly {calc_min} * 0.25) + "
+            f"(Summary {summ_min} * 0.75) = {final_min:.2f}")
     # WIND
     final_wspd = calc_wspd
     if summ_wind is not None:
-        final_wspd = (calc_wspd * 0.5) + (summ_wind * 0.5)
-        print(f"[USL DEBUG] BLENDING WIND: ({calc_wspd} + {summ_wind}) / 2 = {final_wspd:.1f}")
-
+        final_wspd = (calc_wspd * 0.25) + (summ_wind * 0.75)
+        #print(f"[USL DEBUG] BLENDING WIND: ({calc_wspd} + {summ_wind}) / 2 = {final_wspd:.1f}")
+        print(f"[USL DEBUG] BLENDING WIND: "
+            f"(Hourly {calc_wspd} * 0.25) + "
+            f"(Summary {summ_wind} * 0.75) = {final_wspd:.2f}")
+    # PRECIP 
+    final_prcp = total_prcp
+    if summ_prcp is not None:
+        final_prcp = (total_prcp * 0.25) + (summ_prcp * 0.75)
+        print(f"[USL DEBUG] BLENDING PRCP: "
+            f"(Hourly {total_prcp} * 0.25) + "
+            f"(Summary {summ_prcp} * 0.75) = {final_prcp:.3f}")
     return {
         'max': final_max,
         'min': final_min,
         'wspd': final_wspd,
         'gust': 0.0,
-        'prcp': float(total_prcp) # Keep hourly sum for precip to avoid accumulation errors
+        'prcp': float(final_prcp) # Keep hourly sum for precip to avoid accumulation errors
     }
 
 def get_model_hours(run_date, target_start, target_end):
